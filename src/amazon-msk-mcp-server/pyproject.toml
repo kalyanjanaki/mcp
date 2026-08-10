@@ -9,8 +9,11 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "loguru>=0.7.0",
-    "mcp[cli]>=1.6.0",
+    "mcp[cli]>=1.23.0,<2.0.0",
     "pydantic>=2.10.6",
+    "boto3>=1.35.0",
+    "confluent-kafka>=2.5.0",
+    "aws-msk-iam-sasl-signer-python>=1.0.0",
 ]
 license = {text = "Apache-2.0"}
 license-files = ["LICENSE", "NOTICE" ]
