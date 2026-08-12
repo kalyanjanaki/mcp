@@ -221,6 +221,139 @@ async def describe_topics(cluster_arn: str, topics: list[str]) -> dict:
     }
 
 
+_OFFSET_SPEC_ALIASES = {'earliest', 'latest', 'both'}
+
+
+@mcp.tool(name='get_topic_offsets')
+async def get_topic_offsets(cluster_arn: str, topics: list[str], spec: str = 'both') -> dict:
+    """Get per-partition earliest / latest offsets for one or more topics.
+
+    For each partition returns the earliest offset (low watermark, oldest
+    retained message), the latest offset (high watermark, next message to
+    be produced), and the `message_count` between them. Broker-direct,
+    reflects live cluster state.
+
+    Common uses: measure how much data a topic currently retains, detect
+    partitions receiving no producer traffic (latest offset unchanged
+    between two calls), sanity-check whether a topic is empty before
+    debugging a consumer, spot skew in message distribution across
+    partitions.
+
+    Note: `message_count` counts offset gaps, which include compacted
+    tombstones and aborted transactions — not every offset in the range
+    corresponds to a live message. Use it as a scale indicator, not an
+    exact record count.
+
+    Args:
+        cluster_arn: MSK cluster ARN. Resolve any cluster-name-only reference
+            to an ARN first and confirm with the user before invoking.
+        topics: List of topic names. Must be non-empty. This is a per-
+            partition operation, so listing many high-partition-count topics
+            can be expensive — pass only what the agent needs.
+        spec: Which offsets to fetch — `"both"` (default) returns both
+            earliest and latest per partition and computes `message_count`;
+            `"earliest"` returns only the low watermark; `"latest"` returns
+            only the high watermark. When `"earliest"` or `"latest"` is
+            selected, the other field and `message_count` are omitted.
+
+    Returns:
+        Dict with:
+          - cluster_arn
+          - spec: which specs were fetched ("earliest", "latest", or "both")
+          - summary: {topic_count, requested_count, missing_count,
+                      partition_count, total_message_count (only for "both")}
+          - topics: list of {name, partition_count, total_message_count,
+                             partitions: [{id, earliest_offset, latest_offset,
+                                           message_count}]}
+          - missing: list of requested topic names not on the cluster
+    """
+    if not topics:
+        raise ValueError('topics must be a non-empty list of topic names')
+    if spec not in _OFFSET_SPEC_ALIASES:
+        raise ValueError(f'spec must be one of {sorted(_OFFSET_SPEC_ALIASES)}, got {spec!r}')
+
+    admin = _admin_client_for(cluster_arn)
+    md = admin.list_topics(timeout=10)
+
+    partition_targets: list[tuple[str, int]] = []
+    missing: list[str] = []
+    for name in topics:
+        t = md.topics.get(name)
+        if t is None or (t.error is not None and not t.partitions):
+            missing.append(name)
+            continue
+        for pid in sorted(t.partitions.keys()):
+            partition_targets.append((name, pid))
+
+    earliest: dict[tuple[str, int], int] = {}
+    latest: dict[tuple[str, int], int] = {}
+
+    if partition_targets and spec in ('earliest', 'both'):
+        req = {TopicPartition(name, pid): OffsetSpec.earliest() for name, pid in partition_targets}
+        for tp, fut in admin.list_offsets(req, request_timeout=10).items():
+            try:
+                earliest[(tp.topic, tp.partition)] = fut.result().offset
+            except Exception as e:
+                logger.debug(f'list_offsets(earliest) failed for {tp.topic}[{tp.partition}]: {e}')
+
+    if partition_targets and spec in ('latest', 'both'):
+        req = {TopicPartition(name, pid): OffsetSpec.latest() for name, pid in partition_targets}
+        for tp, fut in admin.list_offsets(req, request_timeout=10).items():
+            try:
+                latest[(tp.topic, tp.partition)] = fut.result().offset
+            except Exception as e:
+                logger.debug(f'list_offsets(latest) failed for {tp.topic}[{tp.partition}]: {e}')
+
+    by_topic: dict[str, list[dict]] = {}
+    for name, pid in partition_targets:
+        entry: dict = {'id': pid}
+        if spec in ('earliest', 'both'):
+            entry['earliest_offset'] = earliest.get((name, pid))
+        if spec in ('latest', 'both'):
+            entry['latest_offset'] = latest.get((name, pid))
+        if spec == 'both':
+            e = entry.get('earliest_offset')
+            l = entry.get('latest_offset')
+            entry['message_count'] = max(0, l - e) if e is not None and l is not None else None
+        by_topic.setdefault(name, []).append(entry)
+
+    described: list[dict] = []
+    total_message_count = 0
+    for name, parts in by_topic.items():
+        parts.sort(key=lambda x: x['id'])
+        topic_msg_count = None
+        if spec == 'both':
+            counts = [p['message_count'] for p in parts if p['message_count'] is not None]
+            topic_msg_count = sum(counts) if counts else 0
+            total_message_count += topic_msg_count
+        described.append(
+            {
+                'name': name,
+                'partition_count': len(parts),
+                'total_message_count': topic_msg_count,
+                'partitions': parts,
+            }
+        )
+    described.sort(key=lambda x: x['name'])
+
+    summary: dict = {
+        'topic_count': len(described),
+        'requested_count': len(topics),
+        'missing_count': len(missing),
+        'partition_count': len(partition_targets),
+    }
+    if spec == 'both':
+        summary['total_message_count'] = total_message_count
+
+    return {
+        'cluster_arn': cluster_arn,
+        'spec': spec,
+        'summary': summary,
+        'topics': described,
+        'missing': missing,
+    }
+
+
 # librdkafka returns config source as a raw int; map to human names.
 # ConfigSource is a plain Enum (not IntEnum), so compare via .value.
 _CONFIG_SOURCE_NAME = {
