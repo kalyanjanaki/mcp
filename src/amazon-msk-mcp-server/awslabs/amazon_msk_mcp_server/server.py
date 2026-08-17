@@ -14,9 +14,20 @@
 
 """awslabs amazon-msk MCP Server implementation."""
 
+import argparse
+import base64
 import boto3
+import os
+import time
+import uuid
 from aws_msk_iam_sasl_signer import MSKAuthTokenProvider
-from confluent_kafka import ConsumerGroupTopicPartitions, TopicPartition
+from confluent_kafka import (
+    OFFSET_BEGINNING,
+    OFFSET_END,
+    Consumer,
+    ConsumerGroupTopicPartitions,
+    TopicPartition,
+)
 from confluent_kafka.admin import (
     AdminClient,
     ConfigResource,
@@ -26,6 +37,21 @@ from confluent_kafka.admin import (
 )
 from loguru import logger
 from mcp.server.fastmcp import FastMCP
+
+
+# Sensitive-data access gate. Enabled at startup via CLI flag or env var.
+# Consulted before any tool that returns message payloads runs.
+_ALLOW_SENSITIVE_DATA_ACCESS = False
+
+
+def _sensitive_check(tool_name: str) -> None:
+    if not _ALLOW_SENSITIVE_DATA_ACCESS:
+        raise RuntimeError(
+            f'{tool_name} is disabled because it returns Kafka message payloads, '
+            f'which may contain sensitive data. Restart the server with '
+            f'--allow-sensitive-data-access=true or set env var '
+            f'MSK_MCP_ALLOW_SENSITIVE_DATA_ACCESS=true to enable.'
+        )
 
 
 mcp = FastMCP(
@@ -774,9 +800,318 @@ async def describe_broker_configs(cluster_arn: str, broker_ids: list[int]) -> di
     }
 
 
+_STARTING_OFFSET_KEYS = {
+    'position',
+    'timestamp_ms',
+    'offset',
+    'consumer_group',
+}
+
+
+def _encode_bytes(b) -> tuple:
+    """Return (value, encoding). Try utf-8, fall back to base64."""
+    if b is None:
+        return None, None
+    try:
+        return b.decode('utf-8'), 'utf-8'
+    except (UnicodeDecodeError, AttributeError):
+        return base64.b64encode(b).decode('ascii'), 'base64'
+
+
+def _resolve_starting_offsets(
+    admin: AdminClient,
+    topic: str,
+    partitions: list,
+    starting_offsets: dict,
+) -> list:
+    """Return a list of TopicPartition with .offset populated for the requested start.
+
+    Raises ValueError on malformed input.
+    """
+    keys_present = set(starting_offsets.keys()) & _STARTING_OFFSET_KEYS
+    if len(keys_present) != 1:
+        raise ValueError(
+            f'starting_offsets must have exactly one of {sorted(_STARTING_OFFSET_KEYS)}; '
+            f'got keys {sorted(starting_offsets.keys())}'
+        )
+    key = next(iter(keys_present))
+
+    if key == 'position':
+        pos = starting_offsets['position']
+        if pos == 'earliest':
+            return [TopicPartition(topic, p, OFFSET_BEGINNING) for p in partitions]
+        if pos == 'latest':
+            return [TopicPartition(topic, p, OFFSET_END) for p in partitions]
+        raise ValueError(f"position must be 'earliest' or 'latest'; got {pos!r}")
+
+    if key == 'timestamp_ms':
+        ts = int(starting_offsets['timestamp_ms'])
+        spec = OffsetSpec.for_timestamp(ts)
+        req = {TopicPartition(topic, p): spec for p in partitions}
+        futures = admin.list_offsets(req, request_timeout=10)
+        resolved = []
+        for tp, fut in futures.items():
+            try:
+                offset = fut.result().offset
+            except Exception as e:
+                logger.debug(f'list_offsets(timestamp) failed for {tp}: {e}')
+                offset = OFFSET_END  # no message at/after ts; start at tail
+            if offset < 0:
+                offset = OFFSET_END
+            resolved.append(TopicPartition(topic, tp.partition, offset))
+        return resolved
+
+    if key == 'offset':
+        offset = int(starting_offsets['offset'])
+        target_partition = starting_offsets.get('partition')
+        if target_partition is None:
+            raise ValueError(
+                "starting_offsets 'offset' form requires 'partition' too, "
+                "e.g. {'offset': 12345, 'partition': 0}"
+            )
+        target_partition = int(target_partition)
+        if target_partition not in partitions:
+            raise ValueError(
+                f'partition {target_partition} not in requested partitions {partitions}'
+            )
+        return [TopicPartition(topic, target_partition, offset)]
+
+    if key == 'consumer_group':
+        gid = str(starting_offsets['consumer_group'])
+        req = ConsumerGroupTopicPartitions(group_id=gid)
+        committed = admin.list_consumer_group_offsets([req], request_timeout=10)[gid].result()
+        by_partition = {
+            tp.partition: tp.offset
+            for tp in committed.topic_partitions
+            if tp.topic == topic and tp.offset >= 0
+        }
+        resolved = []
+        for p in partitions:
+            resolved.append(TopicPartition(topic, p, by_partition.get(p, OFFSET_BEGINNING)))
+        return resolved
+
+    raise ValueError(f'unhandled starting_offsets key: {key}')
+
+
+@mcp.tool(name='read_topic_data')
+async def read_topic_data(
+    cluster_arn: str,
+    topic: str,
+    starting_offsets: dict,
+    partitions: list[int] | None = None,
+    max_messages: int = 100,
+    max_bytes: int = 1_000_000,
+    timeout_seconds: int = 10,
+) -> dict:
+    """Read message payloads from a topic. SENSITIVE — disabled by default.
+
+    Returns actual message contents. Because message payloads can contain
+    PII, credentials, PHI, or otherwise sensitive data, this tool is
+    disabled unless the server operator explicitly opted in at startup with
+    `--allow-sensitive-data-access=true` (or env var
+    `MSK_MCP_ALLOW_SENSITIVE_DATA_ACCESS=true`). If the flag is off, this
+    tool raises immediately without contacting the broker.
+
+    Read-only: uses a random one-shot consumer group with auto-commit and
+    auto-offset-store both disabled, and assigns partitions manually. It
+    does NOT interfere with any existing consumer group's committed offsets.
+
+    Bytes are decoded as UTF-8 when possible; otherwise base64-encoded with
+    `key_encoding` / `value_encoding` flagged as `"base64"`. The response
+    is bounded by both `max_messages` and `max_bytes` — whichever hits
+    first. `summary.truncated=true` indicates a limit was reached.
+
+    Args:
+        cluster_arn: MSK cluster ARN. Resolve any cluster-name-only reference
+            to an ARN first (via kafka:ListClusters on the AWS MCP Server or
+            aws-api-mcp-server) and confirm with the user before invoking.
+        topic: Single topic name to read from.
+        starting_offsets: Dict specifying where to start. Provide exactly ONE
+            of these forms:
+              - {"position": "earliest"} — start at the beginning of each
+                partition (respecting retention).
+              - {"position": "latest"} — start at the tail. Usually returns
+                zero messages unless producer traffic arrives during the
+                timeout window.
+              - {"timestamp_ms": 1755000000000} — start at the first offset
+                whose record timestamp is at or after the given epoch ms.
+              - {"offset": 12345, "partition": 0} — start at a specific
+                (partition, offset) pair. `partitions` (below) is ignored.
+              - {"consumer_group": "my-group"} — start from wherever the
+                given consumer group has committed for this topic. Never
+                affects the group's offsets.
+        partitions: Optional list of partition ids to restrict the read to.
+            Defaults to all partitions of the topic. Ignored for the
+            single-partition `{"offset", "partition"}` form.
+        max_messages: Cap on the number of messages returned. Default 100.
+        max_bytes: Cap on cumulative (key + value) bytes, applied before
+            base64 encoding. Default ~1 MB.
+        timeout_seconds: Total wall-clock budget for the read. Reads at
+            `latest` on an idle topic will simply return empty after this
+            elapses.
+
+    Returns:
+        Dict with:
+          - cluster_arn, topic
+          - summary: {message_count, byte_count, partition_count, truncated}
+          - messages: list of {partition, offset, timestamp_ms,
+              timestamp_type, key, key_encoding, value, value_encoding,
+              value_size_bytes, headers}
+    """
+    _sensitive_check('read_topic_data')
+
+    if not topic:
+        raise ValueError('topic must be a non-empty string')
+    if max_messages <= 0:
+        raise ValueError('max_messages must be positive')
+    if max_bytes <= 0:
+        raise ValueError('max_bytes must be positive')
+    if timeout_seconds <= 0:
+        raise ValueError('timeout_seconds must be positive')
+
+    admin = _admin_client_for(cluster_arn)
+    # Passing a topic name to list_topics() returns a phantom entry for missing
+    # topics on some brokers, so list all and check membership.
+    md = admin.list_topics(timeout=10)
+    topic_md = md.topics.get(topic)
+    if topic_md is None or (topic_md.error is not None and not topic_md.partitions):
+        raise ValueError(f'topic {topic!r} not found on cluster')
+
+    all_partition_ids = sorted(topic_md.partitions.keys())
+    requested = partitions if partitions else all_partition_ids
+    for p in requested:
+        if p not in topic_md.partitions:
+            raise ValueError(
+                f'partition {p} not found on topic {topic!r} (available: {all_partition_ids})'
+            )
+
+    start_tps = _resolve_starting_offsets(admin, topic, requested, starting_offsets)
+
+    region = _region_from_arn(cluster_arn)
+    brokers = _get_bootstrap_brokers(cluster_arn, region)
+    consumer = Consumer(
+        {
+            'bootstrap.servers': brokers,
+            'security.protocol': 'SASL_SSL',
+            'sasl.mechanisms': 'OAUTHBEARER',
+            'oauth_cb': lambda cfg: _oauth_cb(cfg, region),
+            'group.id': f'msk-mcp-read-{uuid.uuid4().hex[:12]}',
+            'enable.auto.commit': False,
+            'enable.auto.offset.store': False,
+            'auto.offset.reset': 'error',
+            'client.id': 'awslabs.amazon-msk-mcp-server/read_topic_data',
+        }
+    )
+    consumer.assign(start_tps)
+
+    messages: list[dict] = []
+    partitions_hit: set = set()
+    byte_count = 0
+    truncated = False
+    deadline = time.time() + timeout_seconds
+    poll_budget = min(timeout_seconds, 1.0)
+
+    try:
+        while len(messages) < max_messages and byte_count < max_bytes:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            msg = consumer.poll(timeout=min(poll_budget, remaining))
+            if msg is None:
+                continue
+            if msg.error():
+                logger.debug(f'consumer poll returned error: {msg.error()}')
+                continue
+
+            key_bytes = msg.key()
+            val_bytes = msg.value()
+            key_size = len(key_bytes) if key_bytes else 0
+            val_size = len(val_bytes) if val_bytes else 0
+            if byte_count + key_size + val_size > max_bytes and messages:
+                truncated = True
+                break
+            byte_count += key_size + val_size
+
+            key_str, key_enc = _encode_bytes(key_bytes)
+            val_str, val_enc = _encode_bytes(val_bytes)
+
+            ts_type, ts_val = msg.timestamp()
+            ts_type_name = {
+                0: 'NOT_AVAILABLE',
+                1: 'CREATE_TIME',
+                2: 'LOG_APPEND_TIME',
+            }.get(ts_type, str(ts_type))
+
+            headers_list = []
+            raw_headers = msg.headers() or []
+            for hk, hv in raw_headers:
+                hv_str, hv_enc = _encode_bytes(hv)
+                headers_list.append({'key': hk, 'value': hv_str, 'encoding': hv_enc})
+
+            messages.append(
+                {
+                    'partition': msg.partition(),
+                    'offset': msg.offset(),
+                    'timestamp_ms': ts_val if ts_type != 0 else None,
+                    'timestamp_type': ts_type_name,
+                    'key': key_str,
+                    'key_encoding': key_enc,
+                    'value': val_str,
+                    'value_encoding': val_enc,
+                    'value_size_bytes': val_size,
+                    'headers': headers_list,
+                }
+            )
+            partitions_hit.add(msg.partition())
+
+        if len(messages) >= max_messages:
+            truncated = True
+    finally:
+        consumer.close()
+
+    return {
+        'cluster_arn': cluster_arn,
+        'topic': topic,
+        'summary': {
+            'message_count': len(messages),
+            'byte_count': byte_count,
+            'partition_count': len(partitions_hit),
+            'truncated': truncated,
+        },
+        'messages': messages,
+    }
+
+
 def main():
     """Run the MCP server."""
-    logger.info('Starting awslabs.amazon-msk-mcp-server')
+    global _ALLOW_SENSITIVE_DATA_ACCESS
+
+    parser = argparse.ArgumentParser(
+        prog='awslabs.amazon-msk-mcp-server',
+        description='awslabs Amazon MSK broker-level MCP server.',
+    )
+    parser.add_argument(
+        '--allow-sensitive-data-access',
+        nargs='?',
+        const='true',
+        default=None,
+        help='Enable tools that return message payloads (read_topic_data). '
+        'Off by default. Same effect as MSK_MCP_ALLOW_SENSITIVE_DATA_ACCESS=true.',
+    )
+    args = parser.parse_args()
+
+    env_flag = os.environ.get('MSK_MCP_ALLOW_SENSITIVE_DATA_ACCESS', '').lower()
+    cli_flag = (args.allow_sensitive_data_access or '').lower()
+    _ALLOW_SENSITIVE_DATA_ACCESS = env_flag in ('true', '1', 'yes') or cli_flag in (
+        'true',
+        '1',
+        'yes',
+    )
+
+    logger.info(
+        'Starting awslabs.amazon-msk-mcp-server '
+        f'(sensitive_data_access={_ALLOW_SENSITIVE_DATA_ACCESS})'
+    )
     mcp.run()
 
 
